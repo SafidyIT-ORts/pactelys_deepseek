@@ -4,6 +4,7 @@ __pycache__/
 *$py.class
 clients/
 # C extensions
+.sql
 *.so
 
 # Distribution / packaging
