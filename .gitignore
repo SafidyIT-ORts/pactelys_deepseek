@@ -6,7 +6,7 @@ clients/
 # C extensions
 .sql
 *.so
-
+.env.bak.20260916
 # Distribution / packaging
 .Python
 build/
