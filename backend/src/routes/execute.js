@@ -419,11 +419,14 @@ export async function executeRoutes(fastify) {
   // Mode manuel : le client choisit lui-même catégorie > plugin > commande
   // et remplit un formulaire de paramètres (voir /v1/plugin-catalog) —
   // ZÉRO routage IA sur CE choix-là, le plugin/commande demandés sont
-  // exactement ceux exécutés. pluginRouter.loadCommandContent() complète
-  // ensuite avec 1 à 3 agents + skills choisis automatiquement, mais
-  // restreints aux seuls agents/skills de CE plugin (jamais les 67 autres)
-  // — plus cadré qu'un routage sur tout le catalogue (execute-auto), tout
-  // en gardant la même flexibilité "plusieurs agents si la tâche le justifie".
+  // exactement ceux exécutés. pluginRouter.prepareCommand() choisit ensuite
+  // 1 à 3 agents + skills complémentaires, restreints aux seuls agents/
+  // skills de CE plugin (jamais les 67 autres) — plus cadré qu'un routage
+  // sur tout le catalogue (execute-auto). Chaque agent retenu tourne dans
+  // un appel IA ISOLÉ (voir _runExecuteCommandSteps plus bas) — vraie
+  // séparation de contexte, pas un seul prompt avec plusieurs personas
+  // collées, avec son propre modèle (haiku/sonnet/opus, celui déclaré
+  // dans le frontmatter de l'agent .md).
   // ----------------------------------------------------------
   fastify.post('/v1/actions/execute-command', {
     schema: {
@@ -461,10 +464,10 @@ export async function executeRoutes(fastify) {
       // peu de contexte client (secteur, ICP) sans envoyer tout S01.md.
       const clientContextSummary = (clientFiles.s01 || '').slice(0, 800)
 
-      let promptBody, selectedSteps
+      let commandBlock, selections
       try {
-        ;({ promptBody, steps: selectedSteps } =
-          await pluginRouter.loadCommandContent(plugin, command, parameters, clientContextSummary, provider))
+        ;({ commandBlock, selections } =
+          await pluginRouter.prepareCommand(plugin, command, parameters, clientContextSummary, provider))
       } catch (err) {
         return reply.code(404).send({ success: false, error: err.message })
       }
@@ -476,9 +479,9 @@ export async function executeRoutes(fastify) {
       ))
       const taskId = taskInsert.rows[0].id
 
-      request.log.info({ task_id: taskId, plugin, command, agents: selectedSteps.map(s => s.agent) }, '[ExecuteCommand] Tâche démarrée')
+      request.log.info({ task_id: taskId, plugin, command, agents: selections.map(s => s.agentRow?.agent || null) }, '[ExecuteCommand] Tâche démarrée')
 
-      // steps peut contenir 0 à 3 agents (ou 1 entrée { agent: null, reason }
+      // selections peut contenir 0 à 3 agents (ou 1 entrée { agentRow: null }
       // si aucun n'a été retenu) — renderSteps() côté console affiche déjà
       // un tableau de plusieurs cartes, aucun changement requis là-bas.
       reply.code(202).send({
@@ -486,40 +489,18 @@ export async function executeRoutes(fastify) {
         task_id:   taskId,
         action_id: actionId,
         status:    'in_progress',
-        steps:     selectedSteps.map(s => ({ plugin, agent: s.agent, skills: s.skills, reason: s.reason })),
+        steps:     selections.map(s => ({ plugin, agent: s.agentRow?.agent || null, skills: s.skillRows.map(sk => sk.skill), reason: s.reason })),
       })
 
-      // Exécution en arrière-plan, même pattern que _runExecuteAutoSteps :
-      // la réponse HTTP est déjà partie, le client poll GET /v1/actions/status/:id.
-      ;(async () => {
-        const bgDb = await fastify.pg.connect()
-        try {
-          const resolvedPrompt = _injectMarkdownFiles(promptBody, clientFiles)
-          const userMessage = Object.entries(parameters).filter(([, v]) => v).length
-            ? 'Exécute cette commande avec les paramètres fournis.'
-            : 'Exécute cette commande avec les valeurs par défaut documentées.'
-
-          const { text: output, toolCalls } = await claudeBrain.callAgentStep(resolvedPrompt, userMessage, null, provider)
-
-          // Un seul appel IA couvre tous les agents sélectionnés (glués dans
-          // le même prompt, pas des appels séparés) — même résultat/trace
-          // d'outils rattaché à chaque carte affichée, pour rester cohérent
-          // avec ce que renderSteps() attend par étape.
-          const stepResults = selectedSteps.map(s => ({ plugin, agent: s.agent, skills: s.skills, reason: s.reason, model: provider, output, tool_calls: toolCalls }))
-
-          await withOrgScope(bgDb, org_id, () => bgDb.query(
-            `UPDATE tasks SET status = 'completed', result = $1, step_results = $2, updated_at = NOW()
-             WHERE id = $3 AND org_id = $4 AND status != 'cancelled'`,
-            [output, JSON.stringify(stepResults), taskId, org_id]
-          ))
-          request.log.info({ task_id: taskId }, '[ExecuteCommand] Tâche complétée')
-        } catch (err) {
-          await _markTaskError(bgDb, taskId, org_id, err.message || 'Erreur inconnue')
-          request.log.error({ task_id: taskId, error: err.message, stack: err.stack }, '[ExecuteCommand] Erreur en arrière-plan')
-        } finally {
-          bgDb.release()
-        }
-      })()
+      // Exécution en arrière-plan — un VRAI appel IA isolé PAR AGENT (voir
+      // _runExecuteCommandSteps), pas un seul prompt fourre-tout. La réponse
+      // HTTP est déjà partie, le client poll GET /v1/actions/status/:id.
+      const userInputBase = Object.entries(parameters).filter(([, v]) => v).length
+        ? 'Exécute cette commande avec les paramètres fournis.'
+        : 'Exécute cette commande avec les valeurs par défaut documentées.'
+      _runExecuteCommandSteps(fastify, request.log, org_id, taskId, plugin, commandBlock, selections, clientFiles, userInputBase, provider)
+        .catch(err => request.log.error({ task_id: taskId, error: err.message, stack: err.stack },
+          '[ExecuteCommand] Erreur en arrière-plan'))
 
     } catch (err) {
       const errorMessage = err.message || 'Erreur inconnue'
@@ -689,6 +670,85 @@ async function _runExecuteAutoSteps(fastify, log, orgId, taskId, steps, clientFi
     ))
 
     log.info({ task_id: taskId, steps_executed: steps.length }, '[ExecuteAuto] Tâche complétée (arrière-plan)')
+  } catch (err) {
+    await _markTaskError(db, taskId, orgId, err.message || 'Erreur inconnue')
+    throw err
+  } finally {
+    db.release()
+  }
+}
+
+/**
+ * Exécute la commande choisie manuellement (execute-command) — VRAIE
+ * isolation par agent, même principe que _runExecuteAutoSteps ci-dessus :
+ * un appel IA SÉPARÉ par agent sélectionné (jamais un seul prompt avec
+ * plusieurs personas collées), chacun avec son propre modèle (agentRow.model
+ * — haiku/sonnet/opus, déjà indiqué dans le frontmatter de l'agent .md) et
+ * ses propres outils, utilisés seulement si l'agent en a vraiment besoin.
+ * Pipeline séquentiel : chaque étape voit le résultat de la précédente,
+ * comme pour le mode texte libre. S'il n'y a aucun agent sélectionné
+ * (selections == [{ agentRow: null, ... }]), une seule étape "commande
+ * seule" s'exécute.
+ *
+ * Ajouter un outil de plus à AGENT_TOOLS (claudeBrain.js) ne demande aucun
+ * changement ici : chaque étape appelle callAgentStep() normalement, qui
+ * donne accès à la liste complète des outils à chaque agent.
+ *
+ * @param {import('fastify').FastifyInstance} fastify
+ * @param {import('fastify').FastifyBaseLogger} log
+ * @param {string} orgId
+ * @param {string} taskId
+ * @param {string} plugin
+ * @param {string} commandBlock - texte de la commande (pluginRouter.prepareCommand)
+ * @param {Array<{ agentRow: object|null, skillRows: object[], reason: string }>} selections
+ * @param {{ brand: string, s01: string, claude: string }} clientFiles
+ * @param {string} userInputBase - message de départ (paramètres fournis ou valeurs par défaut)
+ * @param {'deepseek'|'claude'} [provider]
+ */
+async function _runExecuteCommandSteps(fastify, log, orgId, taskId, plugin, commandBlock, selections, clientFiles, userInputBase, provider = 'deepseek') {
+  const db = await fastify.pg.connect()
+  try {
+    let finalResult = null
+    const stepResults = []
+    let cancelled = false
+
+    for (const selection of selections) {
+      const statusCheck = await db.query(`SELECT status FROM tasks WHERE id = $1`, [taskId])
+      if (statusCheck.rows[0]?.status === 'cancelled') {
+        cancelled = true
+        log.info({ task_id: taskId, steps_done: stepResults.length }, '[ExecuteCommand] Tâche annulée par l\'utilisateur')
+        break
+      }
+
+      const stepPrompt = await pluginRouter.buildCommandStepPrompt(commandBlock, selection)
+      const resolvedPrompt = _injectMarkdownFiles(stepPrompt, clientFiles)
+      const userMessage = finalResult
+        ? `${userInputBase}\n\n--- RÉSULTAT ÉTAPE PRÉCÉDENTE ---\n${finalResult}`
+        : userInputBase
+
+      const stepModel = selection.agentRow?.model || null
+      const { text: output, toolCalls } = await claudeBrain.callAgentStep(resolvedPrompt, userMessage, stepModel, provider)
+      finalResult = output
+      stepResults.push({
+        plugin,
+        agent:  selection.agentRow ? selection.agentRow.agent : null,
+        skills: selection.skillRows.map(s => s.skill),
+        reason: selection.reason,
+        model:  stepModel || provider,
+        output,
+        tool_calls: toolCalls,
+      })
+    }
+
+    if (cancelled) return // ne jamais écraser le statut 'cancelled' déjà posé par la route d'annulation
+
+    await withOrgScope(db, orgId, () => db.query(
+      `UPDATE tasks SET status = 'completed', result = $1, step_results = $2, updated_at = NOW()
+       WHERE id = $3 AND org_id = $4 AND status != 'cancelled'`,
+      [finalResult, JSON.stringify(stepResults), taskId, orgId]
+    ))
+
+    log.info({ task_id: taskId, steps_executed: stepResults.length }, '[ExecuteCommand] Tâche complétée (arrière-plan)')
   } catch (err) {
     await _markTaskError(db, taskId, orgId, err.message || 'Erreur inconnue')
     throw err

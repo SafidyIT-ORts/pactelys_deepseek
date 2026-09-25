@@ -362,21 +362,27 @@ async function selectAgentAndSkills(pluginName, commandRow, parameters, clientCo
 }
 
 /**
- * Charge le contenu complet d'une commande précise (mode manuel — l'écran
- * "catégorie > plugin > commande" de la console) et y injecte les
- * paramètres remplis par l'utilisateur. Le plugin/commande vient
- * directement du choix utilisateur — zéro IA sur CE choix-là — mais un
- * agent/skill complémentaire est ensuite choisi automatiquement via
- * selectAgentAndSkills(), restreint aux seuls agents/skills de ce plugin.
+ * Prépare une commande précise (mode manuel — l'écran "catégorie > plugin >
+ * commande" de la console) : lit le fichier, construit le bloc "commande"
+ * (avec paramètres injectés), et choisit 1 à 3 agents/skills complémentaires
+ * DU MÊME PLUGIN. Le plugin/commande vient directement du choix utilisateur
+ * — zéro IA sur CE choix-là.
+ *
+ * NE charge PAS le contenu des agents/skills sur disque ici, et ne les
+ * assemble PAS avec la commande — c'est fait ensuite, UN AGENT À LA FOIS,
+ * par buildCommandStepPrompt(), pour permettre un appel IA ISOLÉ par agent
+ * (vraie séparation de contexte, comme execute-auto le fait déjà pour le
+ * mode texte libre) plutôt qu'un seul prompt fourre-tout avec 3 personas
+ * collées.
  *
  * @param {string} pluginName
  * @param {string} commandName
  * @param {Record<string, string>} [parameters] - valeurs remplies dans le formulaire, clé = nom du paramètre
  * @param {string} [clientContext] - résumé optionnel (secteur, ICP...), pour aider la sélection agent/skill
  * @param {'deepseek'|'claude'} [provider] - défaut 'deepseek'
- * @returns {Promise<{ promptBody: string, steps: Array<{ agent: string|null, skills: string[], reason: string }> }>}
+ * @returns {Promise<{ commandBlock: string, selections: Array<{ agentRow: object|null, skillRows: object[], reason: string }> }>}
  */
-async function loadCommandContent(pluginName, commandName, parameters = {}, clientContext = '', provider = 'deepseek') {
+async function prepareCommand(pluginName, commandName, parameters = {}, clientContext = '', provider = 'deepseek') {
   const commandPath = path.join(GTM_AGENTS_DIR, 'plugins', pluginName, 'commands', `${commandName}.md`)
   let raw
   try {
@@ -391,12 +397,8 @@ async function loadCommandContent(pluginName, commandName, parameters = {}, clie
       filledParams.map(([k, v]) => `- ${k} : ${v}`).join('\n')
     : '\n\nAucun paramètre optionnel rempli — applique les valeurs par défaut documentées dans la commande.'
 
-  const pieces = [`--- COMMANDE : ${pluginName}:${commandName} ---\n${stripFrontmatter(raw)}${paramsBlock}`]
+  const commandBlock = `--- COMMANDE : ${pluginName}:${commandName} ---\n${stripFrontmatter(raw)}${paramsBlock}`
 
-  // Complète la commande (choisie manuellement, zéro IA sur ce choix) avec
-  // 1 à 3 agents (+ skills) les plus pertinents DU MÊME PLUGIN — jamais tout
-  // le catalogue. Un échec ici ne bloque jamais la commande (voir
-  // selectAgentAndSkills : repli silencieux sur agentRow=null).
   const commandDescription = parseFrontmatterField(raw, 'description') || commandName
   const selections = await selectAgentAndSkills(
     pluginName,
@@ -406,28 +408,41 @@ async function loadCommandContent(pluginName, commandName, parameters = {}, clie
     provider
   )
 
-  for (const { agentRow, skillRows } of selections) {
-    if (!agentRow) continue
-    const agentRaw = await fs.readFile(path.join(GTM_AGENTS_DIR, agentRow.path), 'utf-8')
-    pieces.push(`--- AGENT : ${agentRow.agent} ---\n${stripFrontmatter(agentRaw)}`)
-    for (const skillRow of skillRows) {
+  return { commandBlock, selections }
+}
+
+/**
+ * Construit le prompt complet d'UNE SEULE étape isolée : le bloc commande +
+ * (optionnel) UN agent + ses skills + le contexte client — jamais plusieurs
+ * agents collés dans le même texte. Chaque appel à cette fonction correspond
+ * à un appel IA séparé (voir execute.js::_runExecuteCommandSteps), avec son
+ * propre contexte, son propre modèle (agentRow.model, ex: haiku/sonnet/opus
+ * — déjà indiqué dans le frontmatter de chaque agent .md), et ses propres
+ * outils utilisés seulement si utile (rien ne force un agent à appeler un
+ * outil — TOOL_USAGE_HINT encourage la vérification, ne l'impose pas).
+ *
+ * @param {string} commandBlock
+ * @param {{ agentRow: object|null, skillRows: object[] }} selection
+ * @returns {Promise<string>}
+ */
+async function buildCommandStepPrompt(commandBlock, selection) {
+  const pieces = [commandBlock]
+
+  if (selection.agentRow) {
+    const agentRaw = await fs.readFile(path.join(GTM_AGENTS_DIR, selection.agentRow.path), 'utf-8')
+    pieces.push(`--- AGENT : ${selection.agentRow.agent} ---\n${stripFrontmatter(agentRaw)}`)
+    for (const skillRow of selection.skillRows) {
       const skillRaw = await fs.readFile(path.join(GTM_AGENTS_DIR, skillRow.path), 'utf-8')
       pieces.push(`--- SKILL : ${skillRow.skill} ---\n${stripFrontmatter(skillRaw)}`)
     }
   }
 
-  return {
-    promptBody: pieces.join('\n\n') + CLIENT_CONTEXT_BLOCK,
-    steps: selections.map(s => ({
-      agent: s.agentRow ? s.agentRow.agent : null,
-      skills: s.skillRows.map(sk => sk.skill),
-      reason: s.reason,
-    })),
-  }
+  return pieces.join('\n\n') + CLIENT_CONTEXT_BLOCK
 }
 
 export default {
   loadCatalog,
   routeRequest,
-  loadCommandContent,
+  prepareCommand,
+  buildCommandStepPrompt,
 }
