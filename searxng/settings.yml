@@ -1,0 +1,47 @@
+# searxng/settings.yml — Config minimale pour usage interne (Docker network
+# uniquement, jamais exposé publiquement — voir docker-compose.yml : le port
+# n'est bindé que sur 127.0.0.1). C'est ce qui alimente l'outil `web_search`
+# de claudeBrain.js, en remplacement d'un Tavily/Brave payant.
+#
+# use_default_settings: true → on hérite de la config par défaut de l'image
+# (moteurs activés, etc.) et on ne surcharge que ce qui nous concerne.
+
+use_default_settings: true
+
+general:
+  instance_name: "pactelys-searxng-internal"
+
+server:
+  secret_key: "6bc9f9dfbf5d20cdb080edecff4c7d04"
+  # Limiter désactivé : usage interne uniquement (1 seul appelant : le
+  # backend Fastify, via le réseau Docker), pas un instance publique à
+  # protéger contre l'abus.
+  limiter: false
+  image_proxy: false
+
+search:
+  formats:
+    - html
+    - json
+
+# Désactive les moteurs qui bloquent agressivement les IP de datacenter/VPS
+# (Brave, DuckDuckGo, Google CSE ont renvoyé rate-limit/CAPTCHA en usage réel
+# sur ce VPS) et s'appuie sur des moteurs plus tolérants pour ce type de
+# trafic. Toujours agrégés avec la config par défaut (use_default_settings).
+engines:
+  - name: duckduckgo
+    disabled: true
+  - name: brave
+    disabled: true
+  - name: google cse
+    disabled: true
+  - name: bing
+    disabled: false
+  - name: mojeek
+    disabled: false
+  - name: startpage
+    disabled: false
+  - name: qwant
+    disabled: false
+  - name: wikipedia
+    disabled: false

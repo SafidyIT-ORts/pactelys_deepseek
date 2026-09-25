@@ -1,0 +1,76 @@
+services:
+  pactelys-postgres:
+    image: postgres:16-alpine
+    container_name: ${CONTAINER_PREFIX:-pactelys}-postgres
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-pactelys}
+      POSTGRES_USER: pactelys_admin
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    volumes:
+      - pactelys_pg_data:/var/lib/postgresql/data
+    ports:
+      - "127.0.0.1:${POSTGRES_PORT:-5434}:5432"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U pactelys_admin -d ${POSTGRES_DB:-pactelys}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  pactelys-api:
+    build: ./backend
+    container_name: ${CONTAINER_PREFIX:-pactelys}-api
+    environment:
+      NODE_ENV: development
+      DATABASE_URL: postgresql://pactelys_admin:${POSTGRES_PASSWORD}@${CONTAINER_PREFIX:-pactelys}-postgres:5432/${POSTGRES_DB:-pactelys}
+      GEMINI_API_KEY: ${GEMINI_API_KEY}
+      DEEPSEEK_API_KEY: ${DEEPSEEK_API_KEY}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY}
+      JWT_PUBLIC_KEY: ${JWT_PUBLIC_KEY}
+      PUBLIC_API_KEY: ${PUBLIC_API_KEY}
+      SEARXNG_URL: http://${CONTAINER_PREFIX:-pactelys}-searxng:8080
+      JINA_API_KEY: ${JINA_API_KEY}
+    depends_on:
+      - pactelys-postgres
+      - pactelys-searxng
+    networks:
+      - default
+      - n8n_default
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:${API_PORT:-8001}:8000"
+    volumes:
+      - ./backend:/app
+      - /app/node_modules
+      - ./clients:/app/clients
+      - ./gtm-agents-main:/app/gtm-agents-main:ro
+
+  # Recherche web gratuite pour les agents (outil `web_search` dans
+  # claudeBrain.js) : DeepSeek n'a pas de recherche web native comme
+  # Claude Code. SearXNG agrège Google/Bing/DuckDuckGo/Brave... en interne,
+  # gratuit à vie, sans clé, sans quota — jamais exposé hors du réseau
+  # Docker (port bindé sur 127.0.0.1 uniquement, pour debug local).
+  pactelys-searxng:
+    image: searxng/searxng:latest
+    container_name: ${CONTAINER_PREFIX:-pactelys}-searxng
+    volumes:
+      - ./searxng:/etc/searxng:rw
+    ports:
+      - "127.0.0.1:${SEARXNG_PORT:-8081}:8080"
+    restart: unless-stopped
+    networks:
+      - default
+
+# crewai-service retiré : sous-système séparé (CrewAI + API Claude directe),
+# non utilisé par le pipeline DeepSeek/pluginRouter construit et testé ici,
+# et de toute façon non fonctionnel en l'état (dépend de la table
+# source_files, jamais peuplée). À réintroduire seulement si ce sous-système
+# est repris activement.
+
+networks:
+  n8n_default:
+    external: true
+
+volumes:
+  pactelys_pg_data:
+  pactelys_client_files:
